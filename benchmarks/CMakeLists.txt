@@ -13,3 +13,12 @@ if(FILE_INTERFACE)
     target_include_directories(page-cache PRIVATE ${MEGALON_SOURCE_DIR}/include/)
     target_link_libraries(page-cache megalon numa absl::log_initialize)
 endif()
+
+# Ported RACoherence hashmap benchmarks
+add_executable(hashmap-ro hashmap_ro.cc)
+target_include_directories(hashmap-ro PRIVATE ${MEGALON_SOURCE_DIR}/include/)
+target_link_libraries(hashmap-ro megalon numa absl::log_initialize)
+
+add_executable(hashmap-rw hashmap_rw.cc)
+target_include_directories(hashmap-rw PRIVATE ${MEGALON_SOURCE_DIR}/include/)
+target_link_libraries(hashmap-rw megalon numa absl::log_initialize)
