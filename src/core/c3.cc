@@ -345,14 +345,14 @@ std::optional<size_t> C3POHandle::CacheNodeIndexOnLogicalNode(const std::optiona
 }
 
 std::optional<size_t> C3POHandle::CacheNodeIndexOnCxl(const std::optional<common::GCDEntry> &entry_optional) {
-    return CacheNodeIndexOnArrayIdx(entry_optional, cxl_nid_);
+    return CacheNodeIndexOnArrayIdx(entry_optional, kCxlArrayIdx);
 }
 
 /* disabled for logical nodes */
 std::optional<size_t> C3POHandle::FindRemoteCacheNodeIndex(const std::optional<common::GCDEntry> &entry_optional,
                                                            int current_nid, int &remote_nid) {
     for (int i = 0; i < LOGICAL_NODE_NUM + 1; i++) {
-        if (i != cxl_nid_ && i != current_nid && ExistOnArrayIdx(entry_optional, i)) {
+        if (i != kCxlArrayIdx && i != current_nid && ExistOnArrayIdx(entry_optional, i)) {
             remote_nid = i;
             return CacheNodeIndexOnArrayIdx(entry_optional, i);
         }

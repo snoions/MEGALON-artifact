@@ -110,7 +110,21 @@ size_t WriteMetadataManager::SampleReclaim(size_t count
     std::optional<size_t> wmeta_idx;
     size_t wmeta_over_thres = count;
 
+    // Bound the effort. Two ways this loop fails to terminate:
+    //   - SampleVictim() returns nullopt (no unlocked, non-free candidate among its 5
+    //     random samples) and the `continue` retries forever. With the blocking lock this
+    //     could not happen; with the try-lock of section 29 it can and does.
+    //   - SwitchToReadOnly() keeps failing, so wmeta_over_thres never decreases.
+    // Either way work_fn never returns, so its stop_token is never observed and the
+    // destructor's join() hangs at shutdown - while the thread spins a core and hammers
+    // the wmeta seqlocks on the memory node, starving the actual workload.
+    // Giving up is safe: DoReclaim runs again after WMETA_MGR_SLEEP_INTERVAL_NS.
+    const size_t max_attempts = 8 * count + 64;
+    size_t attempts = 0;
+
     while (wmeta_over_thres > 0) {
+        if (++attempts > max_attempts) break;
+
         wmeta_idx = c3po_->Scr_meta()->SampleVictim(MAX_WMETA_SAMPLING_SIZE);
 
         if (!wmeta_idx.has_value()) continue;

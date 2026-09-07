@@ -73,7 +73,7 @@ RESULT_ROOT=${RACKOBJ_RESULT_DIR}hashmap
 # count. Set to 1 for every sample.
 LATENCY_SAMPLE_EVERY="${LATENCY_SAMPLE_EVERY:-100}"
 
-UNCORE_MODE="${UNCORE_MODE:-slow}"
+UNCORE_MODE="${UNCORE_MODE:-pin}"
 SLOW_FREQ_KHZ="${SLOW_FREQ_KHZ:-800000}"
 FAST_FREQ_KHZ="${FAST_FREQ_KHZ:-2400000}"
 
@@ -222,10 +222,12 @@ to_bytes() {   # "36GB" -> bytes
 #   SCR             SCR_SIZE
 # CXL_CAPACITY is only used to warn; set it to your device size.
 CXL_CAPACITY="${CXL_CAPACITY:-16GB}"
+# Percent of key_space added as spare slots; see the note at the call site.
+SLOT_HEADROOM_PCT="${SLOT_HEADROOM_PCT:-25}"
 NUM_NUMA_HINT="${NUM_NUMA_HINT:-4}"
 
-check_capacity() {   # check_capacity <slots>
-    local slots="$1" data meta gcd ncr_have total cap
+check_capacity() {   # check_capacity <slots> [key_space]
+    local slots="$1" key_space="${2:-0}" data meta gcd ncr_have total cap
     data=$(( slots * 1024 ))
     meta=$(( slots * 64 ))
     gcd=$(( slots * 112 * NUM_NUMA_HINT ))
@@ -244,6 +246,11 @@ check_capacity() {   # check_capacity <slots>
     echo "  CacheNode meta   $(( meta / 1024 / 1024 )) MiB"
     echo "  GCD (x${NUM_NUMA_HINT} replicas) $(( gcd / 1024 / 1024 )) MiB"
     echo "  NCR reserved     ${NCR_SIZE}, SCR reserved ${SCR_SIZE}"
+    if [ "$key_space" -gt 0 ] 2>/dev/null; then
+        echo "  wmeta headroom   $(( slots - key_space )) allocations before the reclaimer engages"
+        echo "                   (reclaim threshold ~= slots; the load phase allocates one"
+        echo "                    wmeta per object, so headroom = slots - key_space)"
+    fi
     echo "  total reserved   $(( total / 1024 / 1024 )) MiB of ${CXL_CAPACITY}"
     if [ "$total" -gt "$cap" ]; then
         echo "WARNING: reserved regions exceed CXL_CAPACITY=${CXL_CAPACITY}; expect allocation failure."
@@ -261,8 +268,12 @@ check_capacity() {   # check_capacity <slots>
 }
 
 for variant in "${VARIANTS[@]}"; do
+    # The benchmarks run under sudo, so both the result files and the directories they
+    # create are root-owned. Removing an entry needs write permission on its *parent*
+    # directory, so a plain rm fails on anything the binary created. Use sudo here, and
+    # chown after each run (below) so everything afterwards works unprivileged.
     rm -rf "${LOG_ROOT}/${variant}"; mkdir -p "${LOG_ROOT}/${variant}"
-    rm -rf "${RESULT_ROOT}/${variant}"; mkdir -p "${RESULT_ROOT}/${variant}"
+    sudo rm -rf "${RESULT_ROOT}/${variant}"; mkdir -p "${RESULT_ROOT}/${variant}"
     cp "cmake-variant/CMakeLists_${variant}.txt" CMakeLists.txt
 
     # Lean build: only megalon + the two hashmap binaries, and only the NR variant that
@@ -272,8 +283,17 @@ for variant in "${VARIANTS[@]}"; do
 
     for scr_size in "${SCR_SIZES[@]}"; do
         for num_obj in "${NUM_OBJS[@]}"; do
-            check_capacity $((num_obj + 1000))
-            write_config "${num_obj}" "$((num_obj + 1000))" "${scr_size}MB"
+            # Slot headroom. The wmeta reclaim threshold works out to ~= the slot count
+            # (pool = slots*100/WMETA_WATERMARK, threshold = pool*WMETA_WATERMARK/100), and
+            # the load phase allocates one wmeta per object, so the number of allocations
+            # before the reclaimer engages is exactly slots - key_space. The stock "+1000"
+            # leaves ~1023, which is a knife edge: cross it and SampleVictim starts running
+            # on the critical path, where it deadlocks (blocking lock) or livelocks
+            # (try-lock, unbounded caller retry). SLOT_HEADROOM_PCT gives real margin.
+            slots=$(( num_obj + num_obj * SLOT_HEADROOM_PCT / 100 ))
+            [ "$slots" -gt "$((num_obj + 1000))" ] || slots=$((num_obj + 1000))
+            check_capacity "${slots}" "${num_obj}"
+            write_config "${num_obj}" "${slots}" "${scr_size}MB"
 
             for zipf in "${ZIPFS[@]}"; do
                 # ---------------- read-only ----------------
@@ -290,7 +310,8 @@ for variant in "${VARIANTS[@]}"; do
                 done
                 uncore_reset
                 # src_dir and dst_dir are both under RACKOBJ_RESULT_DIR: copying doubled the space.
-                [ -d "$src_dir" ] && { mkdir -p "$(dirname "$dst_dir")"; mv "$src_dir" "$dst_dir"; }
+                [ -d "$src_dir" ] && { mkdir -p "$(dirname "$dst_dir")"; mv "$src_dir" "$dst_dir"; \
+                    sudo chown -R "$(id -u):$(id -g)" "$dst_dir"; }
 
                 # ---------------- read-write ----------------
                 for w_ratio in "${W_RATIOS[@]}"; do
@@ -307,7 +328,8 @@ for variant in "${VARIANTS[@]}"; do
                     done
                     uncore_reset
                     # src_dir and dst_dir are both under RACKOBJ_RESULT_DIR: copying doubled the space.
-                [ -d "$src_dir" ] && { mkdir -p "$(dirname "$dst_dir")"; mv "$src_dir" "$dst_dir"; }
+                [ -d "$src_dir" ] && { mkdir -p "$(dirname "$dst_dir")"; mv "$src_dir" "$dst_dir"; \
+                    sudo chown -R "$(id -u):$(id -g)" "$dst_dir"; }
                 done
             done
         done

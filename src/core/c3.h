@@ -131,6 +131,11 @@ public:
 
     SharedMetadata *Scr_meta() { return c3po_->scr_meta_.get(); }
 
+    // cn_array_ layout (see GCDEntry in src/core/cache_node.h): index 0 is the CXL copy,
+    // indices 1..LOGICAL_NODE_NUM are the logical nodes. This is an *array index*, not a
+    // NUMA node id - the two only coincide when NUMA_MEM happens to be 0.
+    static constexpr int kCxlArrayIdx = 0;
+
     static inline bool ExistOnArrayIdx(const std::optional<common::GCDEntry> &entry_optional, int nid) {
         return entry_optional.has_value() && entry_optional->cn_array_[nid].cn_idx_.has_value() &&
                !entry_optional->cn_array_[nid].invalidate_;
@@ -174,7 +179,7 @@ public:
     );
 
     bool ExistOnCxl(const std::optional<common::GCDEntry> &entry_optional) {
-        return ExistOnArrayIdx(entry_optional, cxl_nid_);
+        return ExistOnArrayIdx(entry_optional, kCxlArrayIdx);
     }
 
     bool CheckReplicas(const std::optional<common::GCDEntry> &entry_optional) {

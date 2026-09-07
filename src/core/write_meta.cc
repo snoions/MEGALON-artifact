@@ -1,5 +1,7 @@
 #include "write_meta.h"
 
+#include "absl/log/log.h"
+
 namespace rackobj::common {
 
 bool WriteMetadata::WSeqBegin() { return write_seqlock_begin(&seqlock_); }
@@ -7,6 +9,8 @@ bool WriteMetadata::WSeqBegin() { return write_seqlock_begin(&seqlock_); }
 uint32_t WriteMetadata::WSeqEnd() { return write_seqlock_end(&seqlock_); }
 
 bool WriteMetadata::WLockOnly() { return write_seqlock_only(&seqlock_); }
+
+bool WriteMetadata::TryWLockOnly() { return try_write_seqlock_only(&seqlock_); }
 
 void WriteMetadata::WUnlockOnly() { write_sequnlock_only(&seqlock_); }
 
@@ -81,7 +85,13 @@ std::optional<size_t> SharedMetadata::SampleVictim(const size_t sample_size, boo
         if (!with_lock) return idx;
 
         WriteMetadata *wmeta = &b_meta_.wmeta_start_addr_[idx];
-        if (wmeta->WLockOnly()) {
+        // Try-lock, not the blocking WLockOnly(): this function's contract is "returns
+        // nullopt if all locking attempts failed", which the blocking version can never
+        // satisfy. Every reclamation site locks its victim through here, and reclaimers
+        // run on writers' own paths with no ordering between slots, so a blocking lock can
+        // deadlock two reclaimers (or a reclaimer and the WriteMetadataManager) on each
+        // other's slots. A failed try-lock just makes the caller sample again.
+        if (wmeta->TryWLockOnly()) {
             return idx;  // locking succeeded
         }
     }
@@ -153,7 +163,16 @@ std::optional<size_t> SharedMetadata::CheckReserveWmeta(const BlockId &block_id,
          * e.g. when cnt/wmeta_slot_len_ = 0.95 (slots are 5% empty),
          * expectedly we need to traverse 20 slots to find a free slot.
          */
-        if (static_cast<double>(cnt) / static_cast<double>(b_meta_.wmeta_slot_len_) > 0.95) return std::nullopt;
+        if (static_cast<double>(cnt) / static_cast<double>(b_meta_.wmeta_slot_len_) > 0.95) {
+            // Distinguishes "the 95% gate fired" from "the scan failed to find a free
+            // slot". Only the former returns without scanning, which is what a very high
+            // rate of critical-path reclamation implies.
+            LOG_EVERY_N(WARNING, 10000) << "CheckReserveWmeta: gate fired, allocated " << cnt << "/"
+                                        << b_meta_.wmeta_slot_len_ << " = "
+                                        << static_cast<double>(cnt) * 100 / static_cast<double>(b_meta_.wmeta_slot_len_)
+                                        << "% (> 95%), returning nullopt without scanning";
+            return std::nullopt;
+        }
         start_line = static_cast<size_t>(rng());
     }
     for (size_t i = 0; i < b_meta_.wmeta_slot_len_; ++i) {
@@ -167,6 +186,9 @@ std::optional<size_t> SharedMetadata::CheckReserveWmeta(const BlockId &block_id,
         cpu_relax();
     }
 
+    LOG_EVERY_N(WARNING, 10000) << "CheckReserveWmeta: scanned all " << b_meta_.wmeta_slot_len_
+                                << " slots without finding a free one; allocated " << GetWmetaCount() << " (hint "
+                                << (hint.has_value() ? "set" : "unset") << ")";
     return std::nullopt;
 }
 

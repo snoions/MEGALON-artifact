@@ -116,6 +116,12 @@ uint32_t write_seqlock_end(seqlock_t *s);
 
 bool write_seqlock_only(seqlock_t *s);
 
+// Non-blocking variant of write_seqlock_only: one CAS attempt, no spinning.
+// write_seqlock_only() spins on LOCK_BIT until it wins, and only returns false when
+// FREE_BIT is set - so callers written as try-locks (SampleVictim) can never take their
+// failure path, and instead block indefinitely on a slot another thread holds.
+bool try_write_seqlock_only(seqlock_t *s);
+
 void write_sequnlock_only(seqlock_t *s);
 
 uint32_t seqlock_count(seqlock_t *s);

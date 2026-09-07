@@ -147,6 +147,32 @@ uint32_t write_seqlock_end(seqlock_t* s) {
 }
 #endif
 
+bool try_write_seqlock_only(seqlock_t* s) {
+#if C3_RWLOCK == 0
+    uint32_t curr = s->sequence.load(std::memory_order_relaxed);
+#ifdef DYN_WMETA
+    if (curr & FREE_BIT) return false;  // lock is freed
+#endif
+    if ((curr & LOCK_BIT) != 0) return false;  // held by someone else: give up, do not spin
+
+    uint32_t new_seq = curr | LOCK_BIT;
+#ifdef NO_COHERENCE
+    cache_flush(reinterpret_cast<char*>(s), sizeof(s));
+#endif
+    return s->sequence.compare_exchange_strong(curr, new_seq, std::memory_order_acq_rel);
+#else
+    if (!s->rw_lock.try_lock()) return false;
+    uint32_t curr = s->sequence.load(std::memory_order_relaxed);
+#ifdef DYN_WMETA
+    if (curr & FREE_BIT) {
+        s->rw_lock.unlock();
+        return false;
+    }
+#endif
+    return true;
+#endif /* C3_RWLOCK */
+}
+
 bool write_seqlock_only(seqlock_t* s) {
 #if C3_RWLOCK == 0
     while (true) {

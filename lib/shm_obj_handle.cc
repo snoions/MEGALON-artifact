@@ -120,7 +120,6 @@ SharedMemoryObjectHandle<Policy>::~SharedMemoryObjectHandle() {
               << static_cast<double>(write_page_count) * 100 / static_cast<double>(c3po_->Scr_meta()->GetWmetaSlotLen())
               << "%, reclaim count: " << reclaim_count << ", allocate count: " << allocate_count;
 #endif
-
     auto cachep = cache_shrd_ptr_.get();
     size_t nr_active = cachep->GetActivePageCount();
     size_t nr_total = cachep->page_count_;
@@ -322,7 +321,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
 
     /* 9. CheckInsert GCD */
 #ifdef DYN_WMETA
-    common::NrGcdError error = c3po_->Gcd()->CheckAndInsert(block_id, new_index, shared_cache_node_
+    common::NrGcdError error = c3po_->Gcd()->CheckAndInsert(block_id, new_index, common::C3POHandle::kCxlArrayIdx
 #ifdef NR
                                                             ,
                                                             nr_meta
@@ -330,7 +329,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
     );
 #else
     std::optional<size_t> new_wmeta_index_optional = new_index;
-    common::NrGcdError error = c3po_->Gcd()->CheckAndInsert(block_id, new_index, shared_cache_node_
+    common::NrGcdError error = c3po_->Gcd()->CheckAndInsert(block_id, new_index, common::C3POHandle::kCxlArrayIdx
 #ifdef NR
                                                             ,
                                                             nr_meta
@@ -470,11 +469,11 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
 
     /* 8. CheckInsert GCD */
 #ifdef NR
-    common::NrGcdError error =
-        c3po_->Gcd()->CheckAndInsert(block_id, new_index, shared_cache_node_, nr_meta, new_wmeta_index_optional);
+    common::NrGcdError error = c3po_->Gcd()->CheckAndInsert(block_id, new_index, common::C3POHandle::kCxlArrayIdx,
+                                                            nr_meta, new_wmeta_index_optional);
 #else
     common::NrGcdError error =
-        c3po_->Gcd()->CheckAndInsert(block_id, new_index, shared_cache_node_, new_wmeta_index_optional);
+        c3po_->Gcd()->CheckAndInsert(block_id, new_index, common::C3POHandle::kCxlArrayIdx, new_wmeta_index_optional);
 #endif
 
     // RecycleCacheNode if CheckAndInsert fails
@@ -584,11 +583,11 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
 
     /* 8. CheckInsert GCD */
 #ifdef NR
-    common::NrGcdError error =
-        c3po_->Gcd()->CheckAndInsert(block_id, new_index, shared_cache_node_, nr_meta, new_wmeta_index_optional);
+    common::NrGcdError error = c3po_->Gcd()->CheckAndInsert(block_id, new_index, common::C3POHandle::kCxlArrayIdx,
+                                                            nr_meta, new_wmeta_index_optional);
 #else
     common::NrGcdError error =
-        c3po_->Gcd()->CheckAndInsert(block_id, new_index, shared_cache_node_, new_wmeta_index_optional);
+        c3po_->Gcd()->CheckAndInsert(block_id, new_index, common::C3POHandle::kCxlArrayIdx, new_wmeta_index_optional);
 #endif
 
     // RecycleCacheNode if CheckAndInsert fails

@@ -14,6 +14,13 @@ use topology::*;
 use constants::*;
 use types::*;
 
+// Index of the CXL copy in a GCDEntry's cn_array_: always 0, matching C++'s
+// C3POHandle::kCxlArrayIdx (indices 1..=LOGICAL_NODE_NUM are the logical nodes). It is not
+// NUMA_MEM: the two coincide only when NUMA_MEM == 0, as under NUMA emulation. Using NUMA_MEM
+// here meant that, on real CXL (NUMA_MEM != 0), CheckPutArrayWmeta never recorded the slot of
+// an object created with one, leaking one write-metadata slot per created object.
+const CXL_ARRAY_IDX: u64 = 0;
+
 
 // generator function: generate execution NUMA nodes skipping the memory node (NUMA_MEM)
 const fn generate_array() -> [u64; NUM_EXEC] {
@@ -93,6 +100,47 @@ fn linux_chg_affinity(af: AffinityChange) -> usize {
     }
 }
 
+// NUMA placement here is done by moving the *thread* onto the target node's CPUs and
+// relying on first-touch. That assumes every node has CPUs, which holds when the "CXL"
+// node is an emulated second DRAM node, but not on real CXL: a CXL Type 3 device shows up
+// as a memory-only NUMA node with no CPUs. cpus_on_node() then returns an empty vector,
+// sched_setaffinity() is called with an empty mask, fails EINVAL, and the .expect()
+// panics across an extern "C" boundary.
+//
+// For a CPU-less target we cannot move the thread there, so bind the allocation policy
+// instead: set_mempolicy(MPOL_BIND) makes the pages that the following allocation faults
+// in come from that node, which is the placement the affinity switch was after.
+const MPOL_DEFAULT: i64 = 0;
+const MPOL_BIND: i64 = 2;
+const CPULESS_SENTINEL: usize = std::usize::MAX;
+
+fn mempolicy_bind(node: u64) {
+    // maxnode counts bits in the mask, not bytes; one u64 word covers nodes 0..63.
+    let mask: [u64; 1] = [1u64 << (node % 64)];
+    let rc = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_set_mempolicy,
+            MPOL_BIND,
+            mask.as_ptr(),
+            64i64,
+        )
+    };
+    if rc != 0 {
+        eprintln!("nr: set_mempolicy(MPOL_BIND, node {}) failed", node);
+    }
+}
+
+fn mempolicy_default() {
+    unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_set_mempolicy,
+            MPOL_DEFAULT,
+            std::ptr::null::<u64>(),
+            0i64,
+        )
+    };
+}
+
 fn linux_chg_affinity_numa(af: AffinityChange) -> usize {
     match af {
         AffinityChange::Replica(rid) => {
@@ -107,7 +155,14 @@ fn linux_chg_affinity_numa(af: AffinityChange) -> usize {
                 NUMA_EXEC[rid % NUM_EXEC]
             };
 
-            for ncpu in MACHINE_TOPOLOGY.cpus_on_node(rid_numa) {
+            let target_cpus = MACHINE_TOPOLOGY.cpus_on_node(rid_numa);
+            if target_cpus.is_empty() {
+                // Memory-only node (real CXL). Bind allocation instead of migrating.
+                mempolicy_bind(rid_numa);
+                return CPULESS_SENTINEL;
+            }
+
+            for ncpu in target_cpus {
                 cpu_set
                     .set(ncpu.cpu as usize)
                     .expect("Can't toggle CPU in cpu_set");
@@ -119,6 +174,11 @@ fn linux_chg_affinity_numa(af: AffinityChange) -> usize {
         }
 
         AffinityChange::Revert(core_id) => {
+            if core_id == CPULESS_SENTINEL {
+                // We never moved the thread; just drop the allocation binding.
+                mempolicy_default();
+                return 0xdead;
+            }
             let mut cpu_set = nix::sched::CpuSet::new();
             cpu_set.set(core_id).expect("Can't toggle CPU in cpu_set");
             nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpu_set)
@@ -250,7 +310,7 @@ impl Dispatch for NrHashMapFFi {
             Modify::CheckPutArrayWmeta(key, cn, idx, wmeta_idx) => {
                 if !self.storage.contains_key(&key) {
                     let mut value = init_gcd_entry(cn, idx);
-                    if idx == NUMA_MEM {
+                    if idx == CXL_ARRAY_IDX {
                         value.wmeta_idx_ = wmeta_idx;
                     }
                     self.storage.insert(key, value);
@@ -265,7 +325,7 @@ impl Dispatch for NrHashMapFFi {
                         // fail the put if invalidate_ bit is set for the entry
                         panic!("BUG: Attempted to put into an invalidated entry at idx = {}", idx);
                     }
-                    if entry.wmeta_idx_ != -1 && idx != NUMA_MEM {
+                    if entry.wmeta_idx_ != -1 && idx != CXL_ARRAY_IDX {
                         // setting a local replica while in RW shared
                         panic!("BUG: Attempted to add local replica {} while wmeta valid: {}", idx, entry.wmeta_idx_);
                     }
@@ -273,14 +333,14 @@ impl Dispatch for NrHashMapFFi {
                         cn_idx_: cn,
                         invalidate_: false,
                     };
-                    if idx == NUMA_MEM {
+                    if idx == CXL_ARRAY_IDX {
                         entry.wmeta_idx_ = wmeta_idx;
                     }
                     return OptionGCDReponse(Some(GCDReponse {
                         key: key,
                         value: *entry,
                     }));
-                } else if idx == NUMA_MEM {
+                } else if idx == CXL_ARRAY_IDX {
                     // slot is allocated, trying to switch rw mode
                     if wmeta_idx == -1 {
                         // switching to ro, idempotent

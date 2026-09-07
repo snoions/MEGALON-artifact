@@ -33,6 +33,9 @@ public:
 
     [[nodiscard]] bool WLockOnly();
 
+    // Try-lock: fails instead of spinning when the slot is already locked.
+    [[nodiscard]] bool TryWLockOnly();
+
     void WUnlockOnly();
 
     [[nodiscard]] uint32_t RSeqBegin();
