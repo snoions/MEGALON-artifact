@@ -25,7 +25,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <x86intrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -67,32 +66,32 @@ inline constexpr uint32_t kNumArrayEntriesTotal = 2u << 20;
 // VECTOR_ENTRY_NUM / LOCK_NUM = 1024.
 inline constexpr int32_t kWriteKeyShift = 1024;
 
-// Payload transferred per object access.  Must be <= SLOT_SIZE (1024B for the KV build).
-inline constexpr uint64_t kAccessSize = SLOT_SIZE;
-
 // Sentinel written by the loader, so that a lookup of a key that was never inserted
 // misses, exactly like the `entry.key != key` miss path in the original `map_get`.
 inline constexpr int32_t kEmptyKey = INT32_MIN;
-
-// Flush interval for the per-thread op counters (same value kv_store.cc uses).
-inline constexpr uint64_t kFlushThreshold = 5000;
-inline constexpr int kReportInterval = 1;
-inline constexpr int kCooldownTime = 5;
 
 // --------------------------------------------------------------------------------------
 // Bucket layout
 // --------------------------------------------------------------------------------------
 // One MEGALON object == one hash bucket.  The original bucket was an 8-byte
-// {int key; int value;}; here the same header sits at the front of the object and the rest
-// of the slot is the value payload.  Because a whole object is written in a single
-// `rackobj::Put`, the blind-overwrite semantics of the original `map_put` are preserved
-// without any explicit lock: MEGALON serializes concurrent access to an object.
+// {int key; int value;}, and that is all each object holds: the header sits at the front of
+// the object's SLOT_SIZE slot and the rest of the slot is unused.  Because the entry is
+// written in a single `rackobj::Put`, the blind-overwrite semantics of the original
+// `map_put` are preserved without any explicit lock: MEGALON serializes concurrent access
+// to an object.
 struct BucketHeader {
     int32_t key;
     int32_t value;
 };
 static_assert(sizeof(BucketHeader) == 8, "bucket header must stay 8 bytes");
-static_assert(kAccessSize >= sizeof(BucketHeader), "access size too small for the header");
+
+// Bytes moved per Get / Put: just the 8-byte entry, as the originals read and wrote a
+// GlobalEntry directly.  MEGALON's CXL read path copies min(count, SLOT_SIZE) - the stored
+// object length is not consulted (CopyToUserBufferCXL) - so the request size alone decides
+// the data moved per operation.  It is not the footprint: each object still occupies a full
+// SLOT_SIZE slot (1024 B in the KV build), so the table is key_space * SLOT_SIZE bytes.
+inline constexpr uint64_t kAccessSize = sizeof(BucketHeader);
+static_assert(kAccessSize <= SLOT_SIZE, "access size must fit in one slot");
 
 // Same hash the original used (std::hash<int> is the identity on libstdc++, so the key
 // distribution seen by the map is unchanged).
@@ -111,9 +110,11 @@ inline int32_t MapGet(uint8_t* buf, int32_t key, size_t num_buckets) {
     return hdr.value;
 }
 
-// Port of `map_put`.  The original held the region's writer lock only to prevent torn
-// reads of the 8-byte entry; the write itself was a blind overwrite.  A single
-// `rackobj::Put` of the whole object gives the same guarantee here.
+// Port of `map_put`.  The original's write is a blind overwrite (no read-modify-write),
+// so it needs no protection against lost updates; its writer lock prevented torn access
+// to the 8-byte entry - readers seeing a half-written pair, or two writers interleaving.
+// MEGALON provides both per object: Put serialises writers on the object's write
+// seqlock, and a concurrent Get detects the overlap and retries.
 inline void MapPut(uint8_t* buf, int32_t key, int32_t value, size_t num_buckets) {
     const off_t bucket = static_cast<off_t>(BucketOf(key, num_buckets));
     BucketHeader hdr{key, value};
@@ -137,10 +138,32 @@ public:
     void InitForNode(int logical_nid, uint32_t entries_per_node) {
         CHECK(logical_nid >= 0 && logical_nid < LOGICAL_NODE_NUM) << "bad logical node " << logical_nid;
 
+        // The graph array is the node-LOCAL DRAM half of this workload - the original
+        // malloc'd it per process on the exec node. It must never land on NUMA_MEM: that
+        // is the CXL device, and putting the pointer chase there measures CXL latency
+        // instead of the local-vs-remote contrast the benchmark exists to show.
         uint32_t numa_node = UINT32_MAX;
         PCHECK(getcpu(nullptr, &numa_node) != -1) << "getcpu() failed";
+        CHECK(static_cast<int>(numa_node) != NUMA_MEM)
+            << "graph array would be allocated on NUMA_MEM (" << NUMA_MEM << "), the CXL node. "
+            << "rackobj::Register(" << logical_nid << ") should have pinned this thread to an exec node; "
+            << "check RidToNumaNode()/NUM_NUMA in src/common/constants.h.";
 
         const size_t bytes = static_cast<size_t>(entries_per_node) * sizeof(ArrayEntry);
+
+        // numa_alloc_onnode succeeds lazily: with numa_set_strict(1) an over-commit shows
+        // up as the process being killed during first touch, not as a null return. Check
+        // the node actually has the memory first, so the failure is a message.
+        long long node_free = 0;
+        const long long node_size = numa_node_size64(static_cast<int>(numa_node), &node_free);
+        if (node_size > 0 && node_free < static_cast<long long>(bytes)) {
+            LOG(FATAL) << "node " << numa_node << " has " << (node_free >> 20) << " MB free but the graph array "
+                       << "needs " << (bytes >> 20) << " MB. Lower GRAPH_ENTRIES (total is "
+                       << "LOGICAL_NODE_NUM x entries x 8KB = "
+                       << ((static_cast<size_t>(LOGICAL_NODE_NUM) * bytes) >> 20) << " MB across " << LOGICAL_NODE_NUM
+                       << " logical nodes), or lower local_size in the config.";
+        }
+
         void* mem = numa_alloc_onnode(bytes, static_cast<int>(numa_node));
         CHECK(mem != nullptr) << "numa_alloc_onnode(" << bytes << ", " << numa_node << ") failed";
 
@@ -168,7 +191,8 @@ public:
         bytes_[logical_nid] = bytes;
         entries_per_node_ = entries_per_node;
         LOG(INFO) << "logical node " << logical_nid << ": graph array of " << entries_per_node << " entries ("
-                  << (bytes >> 20) << " MB) on numa node " << numa_node;
+                  << (bytes >> 20) << " MB) on numa node " << numa_node << " (DRAM; NUMA_MEM=" << NUMA_MEM
+                  << " is the CXL node and is excluded)";
     }
 
     void Free() {
@@ -206,19 +230,27 @@ inline void GraphTraversal(const ArrayEntry* entries, uint32_t entry_count, uint
 // zipfian generator.
 // --------------------------------------------------------------------------------------
 
+// The originals split the trace evenly: thread `id` reads zipf[per_thread * id + i] for
+// i in [0, per_thread), and NUM_ITERATIONS repeats that same slice. So a thread wraps to the
+// start of *its own slice*, never into another thread's keys.
 class KeySource {
 public:
     // trace == nullptr (or empty) -> MEGALON's ScrambledZipfianGenerator over `key_space`.
-    KeySource(const std::vector<int32_t>* trace, size_t key_space, double theta, size_t trace_offset)
-        : trace_((trace != nullptr && !trace->empty()) ? trace : nullptr), pos_(trace_offset) {
+    KeySource(const std::vector<int32_t>* trace, size_t key_space, double theta, size_t slice_begin, size_t slice_len)
+        : trace_((trace != nullptr && !trace->empty()) ? trace : nullptr),
+          begin_(slice_begin),
+          end_(slice_begin + slice_len),
+          pos_(slice_begin) {
         if (trace_ == nullptr) {
             pattern_ = std::make_unique<rackobj::benchmark::ZipfianAccessPattern>(key_space, theta, 0.0f);
+        } else {
+            CHECK(slice_len > 0 && end_ <= trace_->size()) << "bad trace slice [" << begin_ << ", " << end_ << ")";
         }
     }
 
     int32_t Next() {
         if (trace_ != nullptr) {
-            if (pos_ >= trace_->size()) pos_ = 0;  // wrap, as NUM_ITERATIONS did
+            if (pos_ >= end_) pos_ = begin_;  // next iteration over the same slice
             return (*trace_)[pos_++];
         }
         return static_cast<int32_t>(pattern_->GenerateNextOffset());
@@ -226,6 +258,8 @@ public:
 
 private:
     const std::vector<int32_t>* trace_;
+    size_t begin_;
+    size_t end_;
     size_t pos_;
     std::unique_ptr<rackobj::benchmark::ZipfianAccessPattern> pattern_;
 };
@@ -308,8 +342,7 @@ inline std::vector<int32_t> ResolveKeyTrace(const std::string& trace_arg, size_t
 }
 
 // --------------------------------------------------------------------------------------
-// Timing control (same phase machine as kv_store.cc, so results are directly comparable
-// and `benchmarks/script/avg_lat.py` can consume the output directory)
+// Measurement helpers
 // --------------------------------------------------------------------------------------
 
 // Per-thread coherence counters. These are thread-local inside libmegalon
@@ -351,55 +384,6 @@ inline void LogCoherenceStats(const CoherenceStats& s, uint64_t total_ops) {
               << " reads_that_retried=" << s.retry_invocs;
 }
 
-struct TimingControl {
-    std::atomic<bool> warmup_done{false};
-    std::atomic<bool> measure{false};
-    std::atomic<bool> cooldown{false};
-    std::atomic<bool> stop{false};
-    std::atomic<int64_t> measure_start_ns{-1};
-    std::atomic<int64_t> measure_end_ns{-1};
-};
-
-struct alignas(128) PaddedCounter {
-    std::atomic<uint64_t> ops{0};
-    char padding[128 - sizeof(std::atomic<uint64_t>)];
-
-    PaddedCounter() noexcept : ops(0) {}
-    PaddedCounter(const PaddedCounter&) = delete;
-    PaddedCounter& operator=(const PaddedCounter&) = delete;
-    PaddedCounter(PaddedCounter&&) noexcept : ops(0) {}
-    PaddedCounter& operator=(PaddedCounter&&) noexcept {
-        ops.store(0, std::memory_order_relaxed);
-        return *this;
-    }
-};
-
-inline int64_t NowNs() {
-    using namespace std::chrono;
-    return duration_cast<nanoseconds>(high_resolution_clock::now().time_since_epoch()).count();
-}
-
-// Every measured operation contributes a latency sample, and every thread writes its own
-// file: at 42 threads a 30-second run can produce a gigabyte of text. LATENCY_SAMPLE_EVERY
-// records 1 sample in N instead. Percentiles stay valid under uniform subsampling; only
-// the sample count changes, and the throughput file records the op count separately.
-inline uint64_t LatencySampleEvery() {
-    static const uint64_t n = [] {
-        const char* env = getenv("LATENCY_SAMPLE_EVERY");
-        const uint64_t v = (env != nullptr) ? std::strtoull(env, nullptr, 10) : 1;
-        return (v == 0) ? 1 : v;
-    }();
-    return n;
-}
-
-template <typename T>
-inline void WriteSamples(const std::vector<T>& samples, const std::string& filename) {
-    if (samples.empty()) return;
-    std::ofstream f(filename);
-    CHECK(f.is_open()) << "Failed to open file: " << filename;
-    for (const auto& s : samples) f << std::to_string(s) << '\n';
-}
-
 // Creates `dir` and any missing parents.
 inline void MakeDirs(const std::string& dir) {
     std::string path = dir;
@@ -419,24 +403,46 @@ inline void MakeDirs(const std::string& dir) {
 // Load phase: every bucket must exist as an object before it can be read.
 // Replaces `memset(root->global_entries, 1, ...)` in the originals.
 // --------------------------------------------------------------------------------------
-inline void LoadBuckets(size_t num_buckets, size_t loader_threads) {
-    LOG(INFO) << "loading " << num_buckets << " buckets (" << (num_buckets * kAccessSize >> 20) << " MB of objects)";
+// read_only: load every object in MEGALON's read-only state.
+//
+// A Put with a real buffer admits the object with write metadata (a wmeta slot), and from
+// then on every Get of it takes the writable path: read_seq_start / read_seq_end load the
+// wmeta seqlock in the SCR on the memory node before and after the copy and check the
+// per-node local seqcount. A read-only workload never needs that - nothing will write.
+//
+// CreateEntry() special-cases a null source buffer: "if write_data nullptr, then initialize
+// entry in RO mode" - no wmeta reserved, no copy - and read_seq_start/end then skip all
+// sequence checking. That is how MEGALON's own kv_store.cc warms up when write_ratio == 0,
+// and it matches the original hashmap.cpp, whose reads take no synchronisation at all.
+//
+// The object data is then left as the region was initialised (zeroed), so every bucket
+// header reads {key 0, value 0}: lookups miss, as they did against the original's
+// memset(7) table. With writes in the mix, objects are loaded writable so that the first
+// write to each does not have to allocate write metadata - again as kv_store.cc does.
+inline void LoadBuckets(size_t num_buckets, size_t loader_threads, bool read_only) {
+    LOG(INFO) << "loading " << num_buckets << " buckets (" << (num_buckets * SLOT_SIZE >> 20) << " MB of slots, "
+              << (read_only ? "read-only" : "writable") << ")";
 
     std::vector<std::jthread> loaders(loader_threads);
     ThreadBarrier barrier(loader_threads);
 
     for (size_t t = 0; t < loader_threads; ++t) {
-        loaders[t] = std::jthread([t, loader_threads, num_buckets, &barrier] {
+        loaders[t] = std::jthread([t, loader_threads, num_buckets, read_only, &barrier] {
             rackobj::Register(static_cast<int>(t));
             barrier.Wait();
 
-            auto buf = std::make_unique<uint8_t[]>(kAccessSize);
-            std::memset(buf.get(), 0, kAccessSize);
-            BucketHeader hdr{kEmptyKey, 0};
-            std::memcpy(buf.get(), &hdr, sizeof(hdr));
+            std::unique_ptr<uint8_t[]> holder;
+            const uint8_t* buf = nullptr;
+            if (!read_only) {
+                holder = std::make_unique<uint8_t[]>(kAccessSize);
+                std::memset(holder.get(), 0, kAccessSize);
+                BucketHeader hdr{kEmptyKey, 0};
+                std::memcpy(holder.get(), &hdr, sizeof(hdr));
+                buf = holder.get();
+            }
 
             for (size_t b = t; b < num_buckets; b += loader_threads) {
-                const ssize_t rc = rackobj::Put(buf.get(), kAccessSize, static_cast<off_t>(b));
+                const ssize_t rc = rackobj::Put(buf, kAccessSize, static_cast<off_t>(b));
                 PCHECK(rc != -1) << "load put failed for bucket " << b;
             }
 

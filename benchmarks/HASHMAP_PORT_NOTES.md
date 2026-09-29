@@ -1420,4 +1420,49 @@ num pages cxl: (active|free) ..
 ```
 
 They distinguish a dormant-reclamation run from a churning one, which is the difference
-between the 639k and 58k figures above.etween the 639k and 58k figures above.
+between the 639k and 58k figures above.
+
+
+## 33. One binary: `hashmap`
+
+`hashmap_ro.cc` and `hashmap_rw.cc` have been merged into `benchmarks/hashmap.cc`, built as
+the single target `hashmap`. They had no meaningful difference: the read-write version was
+a strict superset, and at `write_ratio = 0` it differed only by one
+`uniform_real_distribution` draw per operation and an always-empty write-latency vector.
+The two RACoherence originals themselves differed only in that fraction.
+
+```
+hashmap <result dir> <thread cnt> <write ratio> <zipfian theta> <preheat s> <exec s>
+        [ops per thread] [graph entries per node] [key trace file]
+```
+
+| write ratio | equivalent to |
+|---|---|
+| `0.0` | `hashmap.cpp` - lookups only; no RNG draw on the hot loop, no write path |
+| `0.1` | `hashmap_rw.cpp` - 1 in 10 operations is a write |
+| `1.0` | all writes; also skips the draw |
+
+The draw is skipped at both endpoints, so `0.0` is exactly the read-only benchmark rather
+than a mixed benchmark that happens to never write. Out-of-range ratios are rejected.
+
+Output goes to `${RACKOBJ_RESULT_DIR}hashmap-<ratio>/<theta>`, both formatted to two
+decimals (`hashmap-0.00/0.99`, `hashmap-0.10/0.99`).
+
+`scripts/eval/hashmap.sh` now loops over `W_RATIOS=(0.0 0.1)` instead of having separate
+read-only and read-write sections. Ratio `0.00` uses `RO_TRACE` (`$KEY_TRACE/ro`); any other
+ratio uses `RW_TRACE` (`$KEY_TRACE/rw`), preserving the separate-trace setup. Results land in
+`${RESULT_ROOT}/<variant>/w<ratio>-<objs>-<theta>-<scr>MB`.
+
+**A pre-existing bug this fixed.** The binary names its output directory with
+`std::setprecision(2)`, but the script built its staging path from the raw shell string. So
+for write ratio `0.1` the script looked for `hashmap-rw-0.1/` while the binary wrote
+`hashmap-rw-0.10/`; the `[ -d "$src_dir" ]` test was false and **read-write results were
+silently left in the staging directory, never moved to `hashmap/megalon/`, and never
+analysed**. Read-only results only worked because `0.99` already has two decimals; any
+theta like `0.9` would have broken them the same way. The script now formats both with
+`printf '%.2f'`, and warns if the expected directory is missing rather than skipping it.
+If you have earlier read-write results, look for them under
+`${RACKOBJ_RESULT_DIR}hashmap-rw-0.10/`.
+
+`build_lean.sh` defaults to `--targets "megalon hashmap"`; `try_config.sh` and
+`check_consistency.sh` invoke `hashmap` with ratio `0.0`.

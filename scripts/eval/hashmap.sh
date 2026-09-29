@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Runs the two ported RACoherence hashmap benchmarks (read-only and 90/10 read-write).
+# Runs the ported RACoherence hashmap benchmark at each write ratio in W_RATIOS
+# (0.0 = the original read-only hashmap.cpp, 0.1 = the original 90/10 hashmap_rw.cpp).
 # Modelled on scripts/eval/sample.sh.
 
 sudo -v
 while true; do sleep 60; sudo -n true; kill -0 "$$" || exit; done > /dev/null 2>&1 &
 
-PREHEAT_TIME=10
-EXEC_TIME=30
+# Measurement, as in the original benchmarks: a fixed amount of work - each thread makes
+# 10 passes (write ratio 0) or 1 pass (otherwise) over its slice of the trace - and the
+# elapsed time is reported. KEYS_PER_THREAD=0 derives the slice as the originals do
+# (trace size / threads); set it smaller for a quick run.
+KEYS_PER_THREAD="${KEYS_PER_THREAD:-0}"
 
 cd "$(dirname "$0")/../.."
 PROJECT_ROOT="$(pwd)"
@@ -18,13 +22,19 @@ THREAD_COUNTS=(32)
 # shared-memory footprint: NUM_OBJS * 1KiB of object data. 1048576 objects = 1.00 GiB,
 # matching the original's 128M x 8B GlobalEntry table exactly (see notes section 15).
 NUM_OBJS=(1048576)
-W_RATIOS=(0.1)          # for hashmap-rw; hashmap-ro is read-only by construction
+W_RATIOS=(0.0 0.1)      # 0.0 = original hashmap.cpp (read-only), 0.1 = hashmap_rw.cpp
 SCR_SIZES=(200)
 # Entries of the 8KB pointer-chase array PER LOGICAL NODE, in node-local DRAM (never on
-# NUMA_MEM/CXL - the benchmark checks this). Total DRAM = LOGICAL_NODE_NUM x entries x 8KB,
-# so it scales with LOGICAL_NODE_NUM: 65536 is 512 MB per node, i.e. 4 GB at
-# LOGICAL_NODE_NUM=8, on top of local_size per exec node. 0 disables the traversal.
-GRAPH_ENTRIES="${GRAPH_ENTRIES:-8192}"
+# NUMA_MEM/CXL - the benchmark checks this). The originals allocate
+# kNumArrayEntries / server_size entries per process, with kNumArrayEntries = 2 << 20, so
+# ~16 GB in total; a logical node stands in for a server, giving (2 << 20) / LOGICAL_NODE_NUM
+# per logical node and the same 16 GB total. That size matters: the traversal is ~4
+# dependent loads per operation, and a smaller array becomes cache-resident and changes
+# what the benchmark measures. Override only deliberately; 0 disables the traversal.
+LOGICAL_NODE_NUM_CFG=$(grep -E '^#define[[:space:]]+LOGICAL_NODE_NUM[[:space:]]' "${PROJECT_ROOT}/src/common/constants.h" | awk '{print $3}')
+[ -n "$LOGICAL_NODE_NUM_CFG" ] && [ "$LOGICAL_NODE_NUM_CFG" -gt 0 ] 2>/dev/null ||
+    { echo "Error: could not read LOGICAL_NODE_NUM from src/common/constants.h"; exit 1; }
+GRAPH_ENTRIES="${GRAPH_ENTRIES:-$(( (2 << 20) / LOGICAL_NODE_NUM_CFG ))}"
 # Key traces. KEY_TRACE is a directory holding a separate trace per benchmark, so the
 # read-only and read-write runs can be driven by different key streams (files named ro
 # and rw, text or raw int32 - the loader sniffs). Paths are relative
@@ -61,32 +71,78 @@ LOG_ROOT=${PROJECT_ROOT}/logs/hashmap
 RESULT_ROOT=${RACKOBJ_RESULT_DIR}hashmap
 
 # Uncore frequency control.
-#   slow (default) - emulate CXL by dropping the NUMA_MEM package to $SLOW_FREQ_KHZ, as
-#                    the artifact's own eval scripts do. Use on a DRAM-only machine.
-#   pin            - no slowdown, but pin every package to $FAST_FREQ_KHZ so exec-side
-#                    turbo does not add run-to-run variance. Use when NUMA_MEM is real
-#                    CXL memory: the latency is already there, no emulation needed.
-#   off            - touch nothing.
-# Latency sampling. Each thread writes one line per measured operation; at 32 threads over
-# a 30 s window that is gigabytes of text. Record 1 sample in N instead - percentiles are
-# unaffected by uniform subsampling, and throughput comes from the op count, not the sample
-# count. Set to 1 for every sample.
-LATENCY_SAMPLE_EVERY="${LATENCY_SAMPLE_EVERY:-100}"
-
-UNCORE_MODE="${UNCORE_MODE:-pin}"
+#   off (default) - touch nothing; also skips the lsmod check. The uncore floats with the
+#                   governor, so expect some turbo-driven run-to-run variance.
+#   pin           - pin every CPU package's uncore to $FAST_FREQ_KHZ, removing turbo
+#                   variance without emulating anything. Works with a real CXL node: it
+#                   writes sysfs directly rather than via set_uncore_frequency.sh, which
+#                   aborts when NUMA_MEM is not a CPU package. Fails loudly if it cannot.
+#   slow          - emulate CXL by dropping the NUMA_MEM package to $SLOW_FREQ_KHZ, as the
+#                   artifact's own eval scripts do. Emulated CXL only, for the same reason.
+UNCORE_MODE="${UNCORE_MODE:-off}"
 SLOW_FREQ_KHZ="${SLOW_FREQ_KHZ:-800000}"
 FAST_FREQ_KHZ="${FAST_FREQ_KHZ:-2400000}"
+
+UNCORE_SYSFS=/sys/devices/system/cpu/intel_uncore_frequency
+
+# pin: fix every CPU package's uncore at $1 kHz, writing sysfs directly.
+#
+# This deliberately does not go through set_uncore_frequency.sh. That script checks that
+# package_<NUMA_MEM> exists before doing anything - including a reset - and exits 1 if not,
+# which is always the case when NUMA_MEM is a real CXL node (a memory-only node is not a CPU
+# package). Pinning does not depend on which node is memory, so it enumerates the packages
+# itself. Fails loudly rather than silently: a run that was meant to be pinned and was not
+# is not the experiment you think it is.
+uncore_pin_all() {
+    local want="$1" d lo hi f n=0
+    shopt -s nullglob
+    for d in "${UNCORE_SYSFS}"/package_*_die_*; do
+        lo=$(cat "$d/initial_min_freq_khz"); hi=$(cat "$d/initial_max_freq_khz")
+        f="$want"
+        if [ "$f" -lt "$lo" ] || [ "$f" -gt "$hi" ]; then
+            echo "WARNING: $(basename "$d"): ${want} kHz outside [${lo}, ${hi}]; clamping" >&2
+            [ "$f" -lt "$lo" ] && f="$lo"
+            [ "$f" -gt "$hi" ] && f="$hi"
+        fi
+        # Order matters: the kernel rejects min > max and max < min. Drop min to the floor
+        # first, then set max, then raise min to meet it - valid from any starting state.
+        echo "$lo" | sudo tee "$d/min_freq_khz" > /dev/null &&
+            echo "$f" | sudo tee "$d/max_freq_khz" > /dev/null &&
+            echo "$f" | sudo tee "$d/min_freq_khz" > /dev/null ||
+            { echo "ERROR: failed to pin $(basename "$d") to ${f} kHz" >&2; shopt -u nullglob; exit 1; }
+        [ "$(cat "$d/min_freq_khz")" = "$f" ] && [ "$(cat "$d/max_freq_khz")" = "$f" ] ||
+            { echo "ERROR: $(basename "$d") did not take ${f} kHz" >&2; shopt -u nullglob; exit 1; }
+        n=$((n + 1))
+    done
+    shopt -u nullglob
+    [ "$n" -gt 0 ] || { echo "ERROR: no uncore packages under ${UNCORE_SYSFS}" >&2; exit 1; }
+}
+
+# Restore every package to its firmware min/max, also bypassing the NUMA_MEM check.
+uncore_reset_all() {
+    local d
+    shopt -s nullglob
+    for d in "${UNCORE_SYSFS}"/package_*_die_*; do
+        echo "$(cat "$d/initial_min_freq_khz")" | sudo tee "$d/min_freq_khz" > /dev/null
+        echo "$(cat "$d/initial_max_freq_khz")" | sudo tee "$d/max_freq_khz" > /dev/null
+    done
+    shopt -u nullglob
+}
 
 uncore_bench() {   # frequency setting for the measured run
     case "$UNCORE_MODE" in
         slow) ./scripts/set_uncore_frequency.sh "$SLOW_FREQ_KHZ" > /dev/null 2>&1 ;;
-        pin)  ./scripts/set_uncore_frequency.sh "$FAST_FREQ_KHZ" > /dev/null 2>&1 ;;
+        pin)  uncore_pin_all "$FAST_FREQ_KHZ" ;;
         off)  : ;;
         *)    echo "unknown UNCORE_MODE=$UNCORE_MODE (slow|pin|off)"; exit 1 ;;
     esac
 }
 uncore_reset() {   # back to the firmware defaults
-    [ "$UNCORE_MODE" = "off" ] || ./scripts/set_uncore_frequency.sh > /dev/null 2>&1
+    case "$UNCORE_MODE" in
+        slow) ./scripts/set_uncore_frequency.sh > /dev/null 2>&1 ;;
+        pin)  uncore_reset_all ;;
+        off)  : ;;
+    esac
 }
 
 if [ "$UNCORE_MODE" != "off" ] && ! lsmod | grep -q intel_uncore_frequency; then
@@ -116,7 +172,7 @@ for t in "$RO_TRACE" "$RW_TRACE"; do
 done
 
 # With a single exec node (NUM_NUMA=2), every worker thread pins to that one node. Running
-# more threads than it has CPUs oversubscribes and inflates latency, which looks like a
+# more threads than it has CPUs oversubscribes and inflates elapsed time, which looks like a
 # result rather than a configuration mistake.
 check_thread_capacity() {
     local numa_mem num_numa cand exec_cpus=0 n cpus
@@ -137,19 +193,9 @@ check_thread_capacity() {
     for t in "${THREAD_COUNTS[@]}"; do
         if [ "$t" -gt "$exec_cpus" ] 2>/dev/null; then
             echo "  WARNING: THREAD_COUNTS includes ${t}, above the ${exec_cpus} exec CPUs."
-            echo "           Threads will time-share; latency numbers will reflect that."
+            echo "           Threads will time-share; elapsed times will reflect that."
         fi
     done
-}
-
-report_result_budget() {
-    local avail_kb per_thread_est
-    avail_kb=$(df -Pk "$RACKOBJ_RESULT_DIR" | awk 'NR==2 {print $4}')
-    echo "  latency sampling: 1 in ${LATENCY_SAMPLE_EVERY}"
-    echo "  free on result volume: $((avail_kb / 1024)) MiB"
-    if [ "$avail_kb" -lt 2097152 ]; then
-        echo "  WARNING: under 2 GiB free. Raise LATENCY_SAMPLE_EVERY or free space first."
-    fi
 }
 
 if [ -z "$RACKOBJ_RESULT_DIR" ]; then
@@ -257,7 +303,6 @@ check_capacity() {   # check_capacity <slots> [key_space]
     fi
     echo "  ${LOCAL_SIZE} local DRAM per exec NUMA node, mount_directory=${MOUNT_DIR}"
     check_thread_capacity
-    report_result_budget
     if [ "${GRAPH_ENTRIES}" -gt 0 ] 2>/dev/null; then
         ln_num=$(grep -E '^#define[[:space:]]+LOGICAL_NODE_NUM' src/common/constants.h | awk '{print $3}')
         echo "  graph arrays: ${GRAPH_ENTRIES} entries x 8KB x ${ln_num} logical nodes ="
@@ -296,40 +341,39 @@ for variant in "${VARIANTS[@]}"; do
             write_config "${num_obj}" "${slots}" "${scr_size}MB"
 
             for zipf in "${ZIPFS[@]}"; do
-                # ---------------- read-only ----------------
-                src_dir="${RACKOBJ_RESULT_DIR}hashmap-ro/${zipf}"
-                dst_dir="${RESULT_ROOT}/${variant}/ro-${num_obj}-${zipf}-${scr_size}MB"
-                sudo rm -rf "$src_dir"; mkdir -p "$src_dir"
-
-                uncore_bench
-                for num_threads in "${THREAD_COUNTS[@]}"; do
-                    sudo RACKOBJ_CONFIG=${CONFIG_FILE} LATENCY_SAMPLE_EVERY=${LATENCY_SAMPLE_EVERY} \
-                        ./build/benchmarks/hashmap-ro \
-                        "$RACKOBJ_RESULT_DIR" "$num_threads" "$zipf" $PREHEAT_TIME $EXEC_TIME 0 $GRAPH_ENTRIES "$RO_TRACE" \
-                        >> "${LOG_ROOT}/${variant}/output_ro_${zipf}_${scr_size}MB.log" 2>&1
-                done
-                uncore_reset
-                # src_dir and dst_dir are both under RACKOBJ_RESULT_DIR: copying doubled the space.
-                [ -d "$src_dir" ] && { mkdir -p "$(dirname "$dst_dir")"; mv "$src_dir" "$dst_dir"; \
-                    sudo chown -R "$(id -u):$(id -g)" "$dst_dir"; }
-
-                # ---------------- read-write ----------------
+                # One binary, one loop: write ratio 0.0 is the original hashmap.cpp,
+                # 0.1 the original hashmap_rw.cpp.
                 for w_ratio in "${W_RATIOS[@]}"; do
-                    src_dir="${RACKOBJ_RESULT_DIR}hashmap-rw-${w_ratio}/${zipf}"
-                    dst_dir="${RESULT_ROOT}/${variant}/rw-${w_ratio}-${num_obj}-${zipf}-${scr_size}MB"
+                    # The binary names its output directory with std::setprecision(2), so
+                    # 0.1 -> "0.10". Build src_dir the same way, or the [ -d ] test below
+                    # never matches and results are silently left in staging.
+                    w_fmt=$(printf '%.2f' "$w_ratio")
+                    z_fmt=$(printf '%.2f' "$zipf")
+                    src_dir="${RACKOBJ_RESULT_DIR}hashmap-${w_fmt}/${z_fmt}"
+                    dst_dir="${RESULT_ROOT}/${variant}/w${w_fmt}-${num_obj}-${z_fmt}-${scr_size}MB"
                     sudo rm -rf "$src_dir"; mkdir -p "$src_dir"
+
+                    # Separate traces for the read-only and read-write mixes, as configured
+                    # via KEY_TRACE/{ro,rw} (or RO_TRACE / RW_TRACE).
+                    if [ "$w_fmt" = "0.00" ]; then trace="$RO_TRACE"; else trace="$RW_TRACE"; fi
 
                     uncore_bench
                     for num_threads in "${THREAD_COUNTS[@]}"; do
-                        sudo RACKOBJ_CONFIG=${CONFIG_FILE} LATENCY_SAMPLE_EVERY=${LATENCY_SAMPLE_EVERY} \
-                            ./build/benchmarks/hashmap-rw \
-                            "$RACKOBJ_RESULT_DIR" "$num_threads" "$w_ratio" "$zipf" $PREHEAT_TIME $EXEC_TIME 0 $GRAPH_ENTRIES "$RW_TRACE" \
-                            >> "${LOG_ROOT}/${variant}/output_rw_${w_ratio}_${zipf}_${scr_size}MB.log" 2>&1
+                        sudo RACKOBJ_CONFIG=${CONFIG_FILE} \
+                            ./build/benchmarks/hashmap \
+                            "$RACKOBJ_RESULT_DIR" "$num_threads" "$w_ratio" "$zipf" "$KEYS_PER_THREAD" "$GRAPH_ENTRIES" "$trace" \
+                            >> "${LOG_ROOT}/${variant}/output_w${w_fmt}_${z_fmt}_${scr_size}MB.log" 2>&1
                     done
                     uncore_reset
-                    # src_dir and dst_dir are both under RACKOBJ_RESULT_DIR: copying doubled the space.
-                [ -d "$src_dir" ] && { mkdir -p "$(dirname "$dst_dir")"; mv "$src_dir" "$dst_dir"; \
-                    sudo chown -R "$(id -u):$(id -g)" "$dst_dir"; }
+
+                    # src_dir and dst_dir are both under RACKOBJ_RESULT_DIR: move, do not copy.
+                    if [ -d "$src_dir" ]; then
+                        mkdir -p "$(dirname "$dst_dir")"
+                        mv "$src_dir" "$dst_dir"
+                        sudo chown -R "$(id -u):$(id -g)" "$dst_dir"
+                    else
+                        echo "WARNING: expected results in $src_dir, found none (see ${LOG_ROOT}/${variant}/output_w${w_fmt}_${z_fmt}_${scr_size}MB.log)"
+                    fi
                 done
             done
         done
@@ -341,11 +385,14 @@ cd benchmarks/script
 for variant in "${VARIANTS[@]}"; do
     for d in "${RESULT_ROOT}/${variant}"/*; do
         echo "=== $(basename "$d") ===" >> "${LOG_ROOT}/${variant}/stat.log"
-        python3 avg_lat.py "$d" rwtf >> "${LOG_ROOT}/${variant}/stat.log"
+        # "t": throughput from the per-thread throughput-N files (op count, elapsed time).
+        # The benchmark records no per-operation latency, so there is nothing for the
+        # latency modes to read.
+        python3 avg_lat.py "$d" t >> "${LOG_ROOT}/${variant}/stat.log"
     done
 done
 cd "${PROJECT_ROOT}"
 
 cp cmake-variant/CMakeLists_megalon.txt CMakeLists.txt
 echo "Config used: ${CONFIG_FILE} (config/a.yaml left untouched)"
-echo "Done. Throughput in ${LOG_ROOT}, latency stats in ${LOG_ROOT}/*/stat.log"
+echo "Done. Per-run output in ${LOG_ROOT}, throughput summary in ${LOG_ROOT}/*/stat.log"

@@ -47,7 +47,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
 
-TARGETS="${TARGETS:-megalon hashmap-ro hashmap-rw}"
+TARGETS="${TARGETS:-megalon hashmap}"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build}"
 JOBS="${JOBS:-$(nproc)}"
 NR_VARIANT="${NR_VARIANT:-auto}"

@@ -15,10 +15,6 @@ if(FILE_INTERFACE)
 endif()
 
 # Ported RACoherence hashmap benchmarks
-add_executable(hashmap-ro hashmap_ro.cc)
-target_include_directories(hashmap-ro PRIVATE ${MEGALON_SOURCE_DIR}/include/)
-target_link_libraries(hashmap-ro megalon numa absl::log_initialize)
-
-add_executable(hashmap-rw hashmap_rw.cc)
-target_include_directories(hashmap-rw PRIVATE ${MEGALON_SOURCE_DIR}/include/)
-target_link_libraries(hashmap-rw megalon numa absl::log_initialize)
+add_executable(hashmap hashmap.cc)
+target_include_directories(hashmap PRIVATE ${MEGALON_SOURCE_DIR}/include/)
+target_link_libraries(hashmap megalon numa absl::log_initialize)
