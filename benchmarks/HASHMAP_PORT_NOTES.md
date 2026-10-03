@@ -1097,6 +1097,22 @@ supersedes the `selectCacheNode` guard from section 26; that workaround has been
 self-contained fix, and it is the difference between the artifact supporting a real CXL
 device and only supporting an emulated one at node 0.
 
+### The Rust half (found later; see section 34)
+
+The fix above covered the C++ side only. The directory itself, in
+`third-party/nr_rust/ffi/ffi_nr_hashmap.rs`, makes the same assumption: `CheckPutArrayWmeta`,
+the operation `CheckAndInsert` uses to create an object, records the object's write-metadata
+slot only when `idx == NUMA_MEM`. With C++ now passing `kCxlArrayIdx = 0`, on real CXL
+(`NUMA_MEM = 2`) that test is never true, so **every object created with a slot was created
+without the slot recorded, and the slot leaked**. The writable load creates every object, so
+about `key_space` slots leaked before the first measured operation.
+
+Fixed by a Rust constant `CXL_ARRAY_IDX = 0`, matching `kCxlArrayIdx`, used for the four
+comparisons in `CheckPutArrayWmeta`. The file's other uses of `NUMA_MEM` are either genuine
+NUMA node choices or in operations nothing calls (`DeleteIfArray`, reached only through the
+unused `DeleteIfReadOnly`; `CheckCoherenceSlot`, reached only through the unused
+`C3POHandle::CheckCoherence`), and are left alone.
+
 ## 28. Root-owned result files
 
 The benchmarks run under `sudo`, so every latency and throughput file - and every directory
@@ -1206,6 +1222,14 @@ so the scaling experiment could not have shown anything.
 
 ## 30. Keeping the reclaimer dormant: slot headroom
 
+> **Correction (section 34).** On real CXL the reclaimer was engaged because of the slot
+> leak described in section 27's Rust half, not because the headroom was too small: the
+> writable load leaked about `key_space` slots, leaving far fewer than the pool size for
+> the objects. With that fixed, a write run allocates exactly one slot per object during
+> the load and none afterwards, so it stays below the threshold even at the stock
+> `slots = key_space + 1000`. `SLOT_HEADROOM_PCT` remains a harmless safety margin, not a
+> requirement. The arithmetic below is still correct.
+
 The try-lock fix (section 29) removes the deadlock but exposes the next layer: with
 `SampleVictim` now able to fail, the unbounded caller loops in `Admit`/`SwitchRW` spin on
 `continue` instead. Deadlock becomes livelock - visible as 1.62M ops/s decaying to 0 rather
@@ -1259,6 +1283,20 @@ The deeper issues stay open for upstream, and they compound:
    entire reclamation path is close to untested by the artifact's own experiments.
 
 ## 31. The wmeta leak: freeing a slot you do not hold locked
+
+> **Correction (section 34).** Most of what this section measured was a different leak:
+> objects created without their slot recorded (section 27, Rust half). 1,400,956 allocated
+> was about 1,048,576 slots leaked during the load plus about 352,000 in use. The mismatches
+> between the locked and the freed index were a *symptom* of it: reclaimers sampled leaked
+> slots, whose recorded block ids named objects that held a different slot.
+>
+> Without that leak, a sampled slot is the slot its object holds, so upstream's order (lock
+> the sampled slot, switch its object, free the returned slot) is correct, and neither fix
+> in this section is needed. The one below, recycling only when the indices match, still
+> leaked the object's slot whenever they differed. A later version (switch the object to
+> read-only first, then try-lock the slot the switch returned) leaked whenever that try-lock
+> failed, which is rare with one writer and constant with many, and it could switch an object
+> while a write was in progress. Both have been reverted to upstream's code (section 34).
 
 The epilogue from the real-CXL run is the whole diagnosis:
 
@@ -1336,6 +1374,7 @@ no-ops or harmless on the emulated configuration.
 | `megalon-cxl-slot-index-fix.patch` | `cn_array_` CXL slot indexed by NUMA node id, so a logical node aliases the CXL entry when `NUMA_MEM != 0` | 27 |
 | `ffi_nr_hashmap.rs` change | NR affinity switch assumes `NUMA_MEM` has CPUs; binds allocation policy instead when it does not | 19 |
 | `megalon-wmeta-fixes.patch` | reclamation: blocking lock used as a try-lock, unbounded retry loops, and freeing a slot the thread does not hold locked | 29-31 |
+| `megalon-rac-eval-fixes.patch` | reclamation back to upstream's lock-first order; the Rust directory records a created object's slot at the CXL index, not `NUMA_MEM` | 34, 27 |
 
 Verify all three are applied before a run - a half-applied patch looks like a new bug:
 
@@ -1354,10 +1393,15 @@ already carries the same signal:
 seqlock alloc ratio: (N|M) = X%, reclaim count: R, allocate count: A
 ```
 
-A healthy write run keeps the ratio near `key_space / wmeta_pool` with `R` tracking `A`. A
-ratio pinned at 95% means the reservation gate has latched and the result is invalid; a
-ratio pinned at the reclaim threshold with `R` and `A` both large means the run is in the
-churn regime of section 32. If you need the branch histogram again,
+A healthy write run, after the section 34 fixes, ends with exactly `key_space` allocated,
+`allocate count` equal to `key_space` (the load) and `reclaim count: 0`, for example
+
+```
+seqlock alloc ratio: (1048576|1456355) = 72%, reclaim count: 0, allocate count: 1048576
+```
+
+More slots allocated than there are objects means slots are leaking and the result is
+invalid. A ratio pinned at 95% means the reservation gate has latched. If you need the branch histogram again,
 `git log` has it - it was three relaxed atomics in `checkCacheNode`.
 
 ### Real CXL
@@ -1382,6 +1426,13 @@ UNCORE_MODE=slow SLOT_HEADROOM_PCT=25 LATENCY_SAMPLE_EVERY=100 ./scripts/eval/ha
 ```
 
 ### What the write numbers mean
+
+> **Invalid (section 34).** The real-CXL rows below were measured with the slot leak from
+> section 27's Rust half. The "steady state settles at the threshold" explanation that
+> follows was wrong: that was the leak, not how MEGALON behaves. With the fixes, a real-CXL
+> write run at 8 logical nodes and 32 threads, 50% writes, `key_space = 1048576`, completes
+> 200M operations in 10.1 s (20.7M ops/s) with `reclaim count: 0`. The table is kept only
+> as a record of the investigation.
 
 Measured, single writer, `key_space = 1048576`:
 
@@ -1466,3 +1517,81 @@ If you have earlier read-write results, look for them under
 
 `build_lean.sh` defaults to `--targets "megalon hashmap"`; `try_config.sh` and
 `check_consistency.sh` invoke `hashmap` with ratio `0.0`.
+
+
+## 34. Two more reclamation fixes, and which results they invalidate
+
+A 50%-write run on real CXL at 8 logical nodes took about 100 s, with the pool at the 95%
+gate throughout:
+
+```
+seqlock alloc ratio: (1310719|1456355) = 90%, reclaim count: 30410841, allocate count: 31721560
+```
+
+1,310,719 slots allocated against 1,048,576 objects means slots belonging to no object. Two
+separate leaks were responsible.
+
+### 1. Reclamation switched objects before locking their slot
+
+The ordering that replaced section 31's fix was: sample a candidate unlocked, switch its
+object to read-only, then try-lock the slot the switch returned and free it. If the
+try-lock failed, because a writer or another reclaimer held the slot, the object was already
+read-only and the slot was never freed. That is rare with one writer (which is how it passed
+testing) and constant with 32 threads. It could also switch an object while a write to it was
+in progress.
+
+Upstream's order prevents both: lock the sampled slot (through `SampleVictim`), switch the
+object its block id names to read-only, free the slot the switch returns. Holding the slot's
+lock excludes writers (it is the bit `write_seqlock_begin()` takes) and other reclaimers, and
+with leak 2 below fixed, the sampled slot is the slot its object holds. The only exception is
+a slot a writer has just reserved and is about to free again after losing the race to make
+the object writable, and that writer holds the slot's lock, so `SampleVictim`'s try-lock skips
+it. All five sites (three in `lib/shm_obj_handle.cc`, `SampleReclaim` and `IterativeReclaim`
+in `src/manager/wmeta_manager.cc`) are therefore back to upstream's code. The only remaining
+reclamation changes are the two from section 29, which fix real upstream weaknesses:
+`SampleVictim` takes a try-lock instead of a blocking lock, and `SampleReclaim`'s loop is
+bounded. `IterativeReclaim`, compiled only when `SAMPLING` is undefined, is upstream's code
+unchanged, blocking lock included.
+
+(An intermediate fix, a `C3POHandle::ReclaimWmeta()` that looked the slot up in the directory
+and re-checked it under the lock, was correct, and brought this run from 100 s to 64 s, but
+is unnecessary once leak 2 is fixed and was dropped in favour of upstream's code.)
+
+### 2. The directory never recorded a created object's slot (section 27, Rust half)
+
+`CheckPutArrayWmeta` compared the array index with `NUMA_MEM` instead of the CXL index, 0,
+so on real CXL it created objects without recording their slots: about `key_space` slots
+leaked during the load. Fixed in `ffi_nr_hashmap.rs` with `CXL_ARRAY_IDX`. With this fix
+(measured with the `ReclaimWmeta()` version of part 1; reclamation does not run at all here,
+so the two versions of part 1 give the same result):
+
+```
+Elapsed time: 10.0859 seconds
+Total ops: 200000000 (reads=100010786, writes=99989214)
+Aggregate throughput: 20702079 ops/s
+seqlock alloc ratio: (1048576|1456355) = 72%, reclaim count: 0, allocate count: 1048576
+```
+
+This leak explains most of the earlier write-path history: the 59,335 "leaked" slots in the
+first investigation (1,107,911 = 1,048,576 leaked during the load + 59,335 from writes), the
+emulated runs never reclaiming (with `NUMA_MEM = 0` the check happens to be right), and
+section 31's index mismatches.
+
+### Which results are affected
+
+* **Every real-CXL run with writes after a writable load** (`write ratio > 0`) before these
+  fixes is invalid: the leak forced reclamation throughout. Rerun them.
+* **Read-only runs are unaffected:** objects are loaded read-only, without a slot.
+* **Emulated runs (`NUMA_MEM = 0`) are unaffected by leak 2.** They may still have hit
+  leak 1 at high thread counts, if reclamation ran at all; check `reclaim count`.
+* To tell which configuration an old log came from, look at its teardown line
+  `WriteMetadataManager for node N on node M`: `N` is `NUMA_MEM`. Runs reporting `node 0`
+  had their data in DRAM, not on the CXL device, and are not comparable with CXL runs of
+  other systems.
+
+### Graph array size at 8 logical nodes
+
+`scripts/eval/hashmap.sh` had `GRAPH_ENTRIES` hard-coded to 1,048,576 per logical node: the
+originals' 16 GB total at 2 logical nodes, but 64 GB at 8. It now defaults to
+`(2 << 20) / LOGICAL_NODE_NUM` entries per logical node, reading `LOGICAL_NODE_NUM` from
+`src/common/constants.h`, which keeps the total at 16 GB for any logical-node count.
