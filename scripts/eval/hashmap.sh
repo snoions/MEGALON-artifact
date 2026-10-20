@@ -12,12 +12,19 @@ while true; do sleep 60; sudo -n true; kill -0 "$$" || exit; done > /dev/null 2>
 # (trace size / threads); set it smaller for a quick run.
 KEYS_PER_THREAD="${KEYS_PER_THREAD:-0}"
 
+# Trials: each configuration (write ratio, theta, every thread count) is run TRIALS times.
+# With TRIALS > 1 each trial's results go to their own directory, suffixed -t<k>, and
+# stat.log lists every trial followed by the mean, min and max throughput per thread count.
+# With TRIALS=1 (the default) the layout is unchanged.
+TRIALS="${TRIALS:-1}"
+[[ "$TRIALS" =~ ^[1-9][0-9]*$ ]] || { echo "Error: TRIALS must be a positive integer, got '${TRIALS}'"; exit 1; }
+
 cd "$(dirname "$0")/../.."
 PROJECT_ROOT="$(pwd)"
 
 VARIANTS=("megalon")
 ZIPFS=(0.99)
-THREAD_COUNTS=(32)
+THREAD_COUNTS=${THREAD_COUNTS:-32}
 # Object count. One MEGALON object per hash bucket at SLOT_SIZE=1024, so this also sets the
 # shared-memory footprint: NUM_OBJS * 1KiB of object data. 1048576 objects = 1.00 GiB,
 # matching the original's 128M x 8B GlobalEntry table exactly (see notes section 15).
@@ -350,19 +357,24 @@ for variant in "${VARIANTS[@]}"; do
                     w_fmt=$(printf '%.2f' "$w_ratio")
                     z_fmt=$(printf '%.2f' "$zipf")
                     src_dir="${RACKOBJ_RESULT_DIR}hashmap-${w_fmt}/${z_fmt}"
-                    dst_dir="${RESULT_ROOT}/${variant}/w${w_fmt}-${num_obj}-${z_fmt}-${scr_size}MB"
-                    sudo rm -rf "$src_dir"; mkdir -p "$src_dir"
+                    dst_base="${RESULT_ROOT}/${variant}/w${w_fmt}-${num_obj}-${z_fmt}-${scr_size}MB"
+                    run_log="${LOG_ROOT}/${variant}/output_w${w_fmt}_${z_fmt}_${scr_size}MB.log"
 
                     # Separate traces for the read-only and read-write mixes, as configured
                     # via KEY_TRACE/{ro,rw} (or RO_TRACE / RW_TRACE).
                     if [ "$w_fmt" = "0.00" ]; then trace="$RO_TRACE"; else trace="$RW_TRACE"; fi
+
+                  for (( trial = 1; trial <= TRIALS; trial++ )); do
+                    if (( TRIALS == 1 )); then dst_dir="$dst_base"; else dst_dir="${dst_base}-t${trial}"; fi
+                    (( TRIALS > 1 )) && echo "=== trial ${trial}/${TRIALS} ===" >> "$run_log"
+                    sudo rm -rf "$src_dir"; mkdir -p "$src_dir"
 
                     uncore_bench
                     for num_threads in "${THREAD_COUNTS[@]}"; do
                         sudo RACKOBJ_CONFIG=${CONFIG_FILE} \
                             ./build/benchmarks/hashmap \
                             "$RACKOBJ_RESULT_DIR" "$num_threads" "$w_ratio" "$zipf" "$KEYS_PER_THREAD" "$GRAPH_ENTRIES" "$trace" \
-                            >> "${LOG_ROOT}/${variant}/output_w${w_fmt}_${z_fmt}_${scr_size}MB.log" 2>&1
+                            >> "$run_log" 2>&1
                     done
                     uncore_reset
 
@@ -372,8 +384,9 @@ for variant in "${VARIANTS[@]}"; do
                         mv "$src_dir" "$dst_dir"
                         sudo chown -R "$(id -u):$(id -g)" "$dst_dir"
                     else
-                        echo "WARNING: expected results in $src_dir, found none (see ${LOG_ROOT}/${variant}/output_w${w_fmt}_${z_fmt}_${scr_size}MB.log)"
+                        echo "WARNING: expected results in $src_dir, found none (see ${run_log})"
                     fi
+                  done
                 done
             done
         done
@@ -383,13 +396,31 @@ done
 echo "Analyzing..."
 cd benchmarks/script
 for variant in "${VARIANTS[@]}"; do
-    for d in "${RESULT_ROOT}/${variant}"/*; do
-        echo "=== $(basename "$d") ===" >> "${LOG_ROOT}/${variant}/stat.log"
-        # "t": throughput from the per-thread throughput-N files (op count, elapsed time).
-        # The benchmark records no per-operation latency, so there is nothing for the
-        # latency modes to read.
-        python3 avg_lat.py "$d" t >> "${LOG_ROOT}/${variant}/stat.log"
-    done
+     for d in "${RESULT_ROOT}/${variant}"/*; do
+         echo "=== $(basename "$d") ===" >> "${LOG_ROOT}/${variant}/stat.log"
+         # "t": throughput from the per-thread throughput-N files (op count, elapsed time).
+         # The benchmark records no per-operation latency, so there is nothing for the
+         # latency modes to read.
+         python3 avg_lat.py "$d" t >> "${LOG_ROOT}/${variant}/stat.log"
+     done
+     # With several trials, summarise each configuration across them. avg_lat.py's "t" mode
+     # prints "<threads>, <ops/s>" per thread count.
+     if (( TRIALS > 1 )); then
+         for first in "${RESULT_ROOT}/${variant}"/*-t1; do
+             [ -d "$first" ] || continue
+             base="${first%-t1}"
+             echo "=== $(basename "$base"): over ${TRIALS} trials (threads, mean, min, max ops/s) ===" >> "${LOG_ROOT}/${variant}/stat.log"
+             for (( trial = 1; trial <= TRIALS; trial++ )); do
+                 [ -d "${base}-t${trial}" ] && python3 avg_lat.py "${base}-t${trial}" t
+             done | awk -F', *' '/^[0-9]+, *[0-9.eE+-]+$/ {
+                     k = $1; v = $2 + 0; n[k]++; s[k] += v
+                     if (!(k in lo) || v < lo[k]) lo[k] = v
+                     if (!(k in hi) || v > hi[k]) hi[k] = v
+                 } END {
+                     for (k in n) printf "%s, %.1f, %.1f, %.1f (%d trials)\n", k, s[k] / n[k], lo[k], hi[k], n[k]
+                 }' | sort -n >> "${LOG_ROOT}/${variant}/stat.log"
+         done
+     fi
 done
 cd "${PROJECT_ROOT}"
 

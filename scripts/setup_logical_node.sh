@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 
 if [[ -z "$1" || -z "$2" || -z "$3" ]]; then
-    echo "Usage: $0 <NUMA_MEM> <LOGICAL_NODE_NUM> <KEY_SIZE>"
+    echo "Usage: $0 <NUMA_MEM> <LOGICAL_NODE_NUM> <KEY_SIZE> [NUMA_NODES]"
     echo "  <NUMA_MEM>: The NUMA memory node id (e.g. 0)"
     echo "  <LOGICAL_NODE_NUM>: Number of logical nodes/replicas (e.g. 9)"
     echo "  <KEY_SIZE>: Key size in bytes (e.g. 12 or 24)"
+    echo "  [NUMA_NODES]: Number of NUMA nodes to use, excluding headless memory nodes. (e.g. 3)"
     exit 1
 fi
 
@@ -16,6 +17,7 @@ CUR_DIR="$(pwd)"
 NUMA_MEM=$1
 LOGICAL_NODE_NUM=$2
 KEY_SIZE=$3
+NUMA_NODES=$4
 constants_file="../src/common/constants.h"
 rust_constants_file="../third-party/nr_rust/ffi/constants.rs"
 common_file="../benchmarks/common.h"
@@ -30,7 +32,7 @@ get_numa_nodes() {
     fi
 }
 
-numa_nodes=$(get_numa_nodes)
+numa_nodes=${NUMA_NODES:-$(get_numa_nodes)}
 # Sanity check: require at least 2 NUMA nodes
 if [ "$numa_nodes" -lt 2 ]; then
     echo "Warning: Detected only $numa_nodes NUMA node(s). At least 2 NUMA nodes are required for proper logical node setup."
@@ -38,7 +40,7 @@ if [ "$numa_nodes" -lt 2 ]; then
     exit 1
 fi
 
-echo "detected hardware numa nodes: $numa_nodes, set NUMA_MEM=$NUMA_MEM, LOGICAL_NODE_NUM=$LOGICAL_NODE_NUM, KEY_SIZE=$KEY_SIZE"
+echo "Hardware numa nodes to use: $numa_nodes, set NUMA_MEM=$NUMA_MEM, LOGICAL_NODE_NUM=$LOGICAL_NODE_NUM, KEY_SIZE=$KEY_SIZE"
 
 # Update LOGICAL_NODE_NUM to value of $LOGICAL_NODE_NUM
 sed -i "s/^\(#define[ \t]*LOGICAL_NODE_NUM[ \t]*\).*\$/\1$LOGICAL_NODE_NUM  \/\/ this should match the rust library/" "$constants_file"
