@@ -1,5 +1,9 @@
 // change these numbers to change where to allocate log memory / put replicas
 
+// whether NUMA_MEM may also be an execution node (see EXEC_ON_MEM in src/common/constants.h;
+// the two must match): the execution nodes are then nodes 0 .. NUM_EXEC - 1
+pub const EXEC_ON_MEM: bool = false;
+
 // hardware numa memory node
 pub const NUMA_MEM: u64 = 0;
 

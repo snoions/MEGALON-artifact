@@ -59,6 +59,13 @@
 #define NUMA_MEM 0
 #define BUCKET_POW 10
 
+// 0: the execution nodes are the first NUM_NUMA - 1 nodes other than NUMA_MEM (CXL, or CXL
+//    emulated on a remote socket). 1: NUMA_MEM may also be an execution node, with no CXL
+//    emulation - e.g. NUMA_MEM 0 and NUM_NUMA 1 runs everything on node 0; the execution
+//    nodes are then nodes 0 .. NUM_NUMA - 1, and NUM_NUMA counts them. Must match
+//    EXEC_ON_MEM in third-party/nr_rust/ffi/constants.rs (setup_logical_node.sh sets both).
+#define EXEC_ON_MEM 0
+
 #define RACKOBJ_CONFIG_ALLOWED_DIRTY_RATIO 100
 
 // seqcount.h

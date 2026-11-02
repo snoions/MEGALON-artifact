@@ -82,7 +82,7 @@ size_t GetConfigSize_t(std::string c_name) {
     if (c_name == "key_space") {
         return lib::client_cfg.GetKeySpace();
     } else if (c_name == "num_exec_numa") {
-        return static_cast<size_t>(NUM_NUMA) - 1;
+        return static_cast<size_t>(NUM_NUMA) - (EXEC_ON_MEM ? 0 : 1);
     } else if (c_name == "num_logical_node") {
         return LOGICAL_NODE_NUM;
     } else if (c_name == "logical_nid") {

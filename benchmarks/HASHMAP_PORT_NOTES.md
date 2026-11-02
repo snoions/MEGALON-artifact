@@ -112,7 +112,32 @@ panicked. For a CPU-less node it now binds the allocation policy instead
 
 The reclamation sites themselves are upstream's code.
 
-### 3.4 Other
+### 3.4 Execution on the memory node (`EXEC_ON_MEM`)
+
+By default the execution nodes are the first `NUM_NUMA - 1` nodes other than `NUMA_MEM`, so
+the memory node never runs benchmark threads. With `EXEC_ON_MEM 1`, which must be set in
+both `src/common/constants.h` and `third-party/nr_rust/ffi/constants.rs`, `NUMA_MEM` may
+also be an execution node, with no CXL emulation: the execution nodes are nodes
+0 .. `NUM_NUMA - 1`, and `NUM_NUMA` counts only them. For example, `NUMA_MEM 0`,
+`NUM_NUMA 1` runs everything on node 0, which also works on a single-socket machine.
+
+- `GetExecNodes()` (`src/common/helper.cc`) and the Rust `generate_array()` skip `NUMA_MEM`
+  only when `EXEC_ON_MEM` is 0; with it set, the Rust node-count assert expects
+  `NUM_NUMA == NUM_EXEC`.
+- `GetNrMetaTid()` (`src/index/gcd_nr.cc`) accepts threads running on `NUMA_MEM`, and the
+  benchmark lets its graph array live there.
+- `SharedMemoryObjectHandle` (`lib/shm_obj_handle.cc`) allows a single NUMA node and
+  allocates a local memory region on `NUMA_MEM` too; `GetConfigSize_t("num_exec_numa")`
+  (`lib/globals.cc`) counts it.
+- `EXEC_ON_MEM=1 ./scripts/setup_logical_node.sh <NUMA_MEM> <LOGICAL_NODE_NUM> <KEY_SIZE>
+  [NUMA_NODES]` writes both files; `NUMA_NODES` is then the number of execution nodes
+  (default 1), and two NUMA nodes are no longer required. `setup_lean.sh`'s `NUM_NUMA`
+  override and `hashmap.sh`'s CPU check follow the same rule, and `build_lean.sh` includes
+  it in the Rust library's cache stamp.
+- `hashmap.sh` refuses `UNCORE_MODE=slow` with it, since slowing `NUMA_MEM`'s package would
+  also slow the benchmark's own CPUs.
+
+### 3.5 Other
 
 - `third-party/nr_rust/rust-toolchain` no longer requests the `rustc-dev` component.
 - `benchmarks/common.h`: `CPU_FREQ_GHZ` is 0.8 (was 2.1). Only `ycsb_benchmark.cc` uses it,
@@ -133,6 +158,10 @@ healthy run with writes, `allocated` equals `NUM_OBJS`, `allocate count` equals 
 leaking, and `CheckReserveWmeta` warnings mean the pool hit its 95% gate.
 
 ## 5. Known limitations
+
+- With `EXEC_ON_MEM 1`, the flush and evict managers, which are not created in this build,
+  would still treat a node equal to `NUMA_MEM` as the CXL node; and `ycsb_benchmark`,
+  `page_cache` and `kv_store` assume the execution nodes are 1 .. n (`NUMA_MEM 0`).
 
 - `IterativeReclaim`, compiled only without `SAMPLING`, still uses a blocking lock. The KV
   build defines `SAMPLING`.

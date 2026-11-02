@@ -55,7 +55,7 @@ const NrFfi::NrMeta* GlobalCacheDirectoryHandleNr::GetNrMetaTid(int rid, bool lo
     std::thread::id tid = std::this_thread::get_id();
     uint32_t numa_node = UINT32_MAX;
     int rc = getcpu(nullptr, &numa_node);
-    if (rc == -1 || numa_node == NUMA_MEM) {
+    if (rc == -1 || (!EXEC_ON_MEM && numa_node == NUMA_MEM)) {
         LOG(ERROR) << "getcpu() failed || numa node is " << NUMA_MEM;
         return nullptr;
     }

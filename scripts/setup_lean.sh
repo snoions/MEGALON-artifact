@@ -334,7 +334,8 @@ node_has_cpus() { [[ -s "/sys/devices/system/node/node$1/cpulist" ]] && [[ -n "$
 
 if [[ -n "${NUM_NUMA_OVERRIDE}" ]]; then
     sed -i -E "s|^(#define[[:space:]]+NUM_NUMA[[:space:]]+)[0-9]+|\1${NUM_NUMA_OVERRIDE}|" src/common/constants.h
-    sed -i -E "s|^(pub const NUM_EXEC: usize = ).*|\1$((NUM_NUMA_OVERRIDE - 1));|" third-party/nr_rust/ffi/constants.rs
+    # With EXEC_ON_MEM=1, NUM_NUMA counts only execution nodes (NUMA_MEM may be one of them).
+    sed -i -E "s|^(pub const NUM_EXEC: usize = ).*|\1$((NUM_NUMA_OVERRIDE - (${EXEC_ON_MEM:-0} == 1 ? 0 : 1)));|" third-party/nr_rust/ffi/constants.rs
     log "NUM_NUMA overridden to ${NUM_NUMA_OVERRIDE} (NUM_EXEC=$((NUM_NUMA_OVERRIDE - 1)))"
 fi
 

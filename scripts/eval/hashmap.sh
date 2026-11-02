@@ -152,6 +152,12 @@ uncore_reset() {   # back to the firmware defaults
     esac
 }
 
+EXEC_ON_MEM_CFG=$(awk '$1 == "#define" && $2 == "EXEC_ON_MEM" {print $3; exit}' src/common/constants.h)
+if [ "${EXEC_ON_MEM_CFG:-0}" = 1 ] && [ "$UNCORE_MODE" = "slow" ]; then
+    echo "Error: UNCORE_MODE=slow emulates CXL by slowing NUMA_MEM's package, but with EXEC_ON_MEM=1"
+    echo "       NUMA_MEM is also an execution node, so it would slow the benchmark's own CPUs."
+    exit 1
+fi
 if [ "$UNCORE_MODE" != "off" ] && ! lsmod | grep -q intel_uncore_frequency; then
     echo "Uncore frequency driver not loaded (sudo modprobe intel_uncore_frequency),"
     echo "or set UNCORE_MODE=off if this machine has real CXL memory and you do not"
@@ -185,10 +191,14 @@ check_thread_capacity() {
     local numa_mem num_numa cand exec_cpus=0 n cpus
     numa_mem=$(grep -E '^#define[[:space:]]+NUMA_MEM' src/common/constants.h | awk '{print $3}')
     num_numa=$(grep -E '^#define[[:space:]]+NUM_NUMA' src/common/constants.h | awk '{print $3}')
+    # Execution nodes: the first NUM_NUMA-1 nodes other than NUMA_MEM, or with EXEC_ON_MEM
+    # nodes 0 .. NUM_NUMA-1 (see src/common/helper.cc, GetExecNodes).
+    local num_exec=$((num_numa - 1)) skip_mem=1
+    if [ "$EXEC_ON_MEM_CFG" = 1 ]; then num_exec=$num_numa; skip_mem=0; fi
     cand=0
     local listed=0
-    while [ "$listed" -lt "$((num_numa - 1))" ] && [ "$cand" -lt 64 ]; do
-        if [ "$cand" != "$numa_mem" ]; then
+    while [ "$listed" -lt "$num_exec" ] && [ "$cand" -lt 64 ]; do
+        if [ "$skip_mem" = 0 ] || [ "$cand" != "$numa_mem" ]; then
             cpus=$(cat "/sys/devices/system/node/node${cand}/cpulist" 2>/dev/null)
             n=$(echo "$cpus" | awk -F, '{t=0; for(i=1;i<=NF;i++){split($i,r,"-"); t += (r[2]=="")?1:(r[2]-r[1]+1)} print t}')
             exec_cpus=$((exec_cpus + n))

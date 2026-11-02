@@ -149,15 +149,19 @@ size_t convert_mem_size(std::string input) {
     return number * multiplier;
 }
 
-// Build NUMA_EXEC equivalent: all node indices except NUMA_MEM
-// Static one-time initialization since it only depends on constants
+// Build NUMA_EXEC equivalent: the first kNumExec node indices, skipping NUMA_MEM unless
+// EXEC_ON_MEM. Static one-time initialization since it only depends on constants
 static const std::vector<int>& GetExecNodes() {
     static const std::vector<int> exec_nodes = []() {
         std::vector<int> nodes;
+#if EXEC_ON_MEM
+        const int kNumExec = NUM_NUMA;      // equals Rust NUM_EXEC
+#else
         const int kNumExec = NUM_NUMA - 1;  // equals Rust NUM_EXEC
+#endif
         nodes.reserve(kNumExec);
         for (int candidate = 0; static_cast<int>(nodes.size()) < kNumExec; ++candidate) {
-            if (candidate == NUMA_MEM) continue;
+            if (!EXEC_ON_MEM && candidate == NUMA_MEM) continue;
             nodes.push_back(candidate);
         }
         return nodes;

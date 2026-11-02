@@ -141,10 +141,11 @@ public:
         // The graph array is the node-LOCAL DRAM half of this workload - the original
         // malloc'd it per process on the exec node. It must never land on NUMA_MEM: that
         // is the CXL device, and putting the pointer chase there measures CXL latency
-        // instead of the local-vs-remote contrast the benchmark exists to show.
+        // instead of the local-vs-remote contrast the benchmark exists to show. (With
+        // EXEC_ON_MEM, NUMA_MEM is an execution node's own DRAM, so there it is allowed.)
         uint32_t numa_node = UINT32_MAX;
         PCHECK(getcpu(nullptr, &numa_node) != -1) << "getcpu() failed";
-        CHECK(static_cast<int>(numa_node) != NUMA_MEM)
+        CHECK(EXEC_ON_MEM || static_cast<int>(numa_node) != NUMA_MEM)
             << "graph array would be allocated on NUMA_MEM (" << NUMA_MEM << "), the CXL node. "
             << "rackobj::Register(" << logical_nid << ") should have pinned this thread to an exec node; "
             << "check RidToNumaNode()/NUM_NUMA in src/common/constants.h.";

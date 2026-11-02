@@ -28,7 +28,7 @@ SharedMemoryObjectHandle<Policy>::SharedMemoryObjectHandle(const int node, const
     size_t shared_num_slots = static_cast<size_t>((static_cast<size_t>(cfg.GetNumSlots()) + 63) & ~63ULL);
     CHECK(numa_available() != -1) << "libnuma not available";
 
-    CHECK(NUM_NUMA > 1) << "There is only 1 NUMA node";
+    CHECK(EXEC_ON_MEM || NUM_NUMA > 1) << "There is only 1 NUMA node";
     size_t num_slots = shared_num_slots / static_cast<size_t>(LOGICAL_NODE_NUM);
 
     LOG(INFO) << "Initializing cache with num element " << shared_num_slots << " on node " << node;
@@ -43,9 +43,10 @@ SharedMemoryObjectHandle<Policy>::SharedMemoryObjectHandle(const int node, const
     c3po_->InitSharedMetadata(shared_num_slots, sc_shm_region_, &cache_shrd_ptr_->scr_bitmap_);
     c3po_->SetPartitionRatio(cfg.GetKeySpace(), cfg.GetPartitionRatio());
 
-    // allocate local memory on each physical numa node except node 0 (memory node)
+    // allocate local memory on each physical numa node except the memory node, unless it is
+    // also an execution node (EXEC_ON_MEM)
     for (int i = 0; i < NUM_NUMA; i++) {
-        if (i == node) continue;
+        if (!EXEC_ON_MEM && i == node) continue;
         local_region_[i] = std::make_shared<common::AllocatableLocalMemoryRegion>(i, cfg.GetLocalSize());
     }
 

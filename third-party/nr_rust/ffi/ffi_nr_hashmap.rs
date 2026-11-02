@@ -22,13 +22,14 @@ use types::*;
 const CXL_ARRAY_IDX: u64 = 0;
 
 
-// generator function: generate execution NUMA nodes skipping the memory node (NUMA_MEM)
+// generator function: generate execution NUMA nodes, skipping the memory node (NUMA_MEM)
+// unless EXEC_ON_MEM
 const fn generate_array() -> [u64; NUM_EXEC] {
     let mut arr = [0; NUM_EXEC];
     let mut filled = 0;
     let mut candidate: u64 = 0;
     while filled < NUM_EXEC {
-        if candidate == NUMA_MEM {
+        if !EXEC_ON_MEM && candidate == NUMA_MEM {
             candidate += 1;
             continue;
         }
@@ -630,7 +631,9 @@ pub extern "C" fn create_node_replicated_numa(
 
     assert!(numa_mem == NUMA_MEM);
 
-    assert!(numa_num == NUM_EXEC + 1);
+    // C++ passes NUM_NUMA: the execution nodes plus NUMA_MEM, or only the execution nodes
+    // when NUMA_MEM is one of them
+    assert!(numa_num == NUM_EXEC + if EXEC_ON_MEM { 0 } else { 1 });
 
     let nrht = Arc::new(
         NodeReplicated::<NrHashMapFFi>::new_with_data_and_base_addr_numa(

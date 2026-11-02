@@ -141,7 +141,7 @@ fi
 NR_PREBUILT="${NR_DIR}/prebuilt"
 
 nr_constants_stamp() {
-    awk '/^pub const (LOGICAL_NODE_NUM|NUMA_MEM|NUM_EXEC|KEY_SIZE)/ {gsub(/[ ;]/,""); print}' \
+    awk '/^pub const (LOGICAL_NODE_NUM|NUMA_MEM|NUM_EXEC|KEY_SIZE|EXEC_ON_MEM)/ {gsub(/[ ;]/,""); print}' \
         "${NR_FFI}/constants.rs" 2>/dev/null | sort | tr '\n' ' '
 }
 
