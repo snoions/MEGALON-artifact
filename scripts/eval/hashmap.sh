@@ -43,8 +43,7 @@ LOGICAL_NODE_NUM_CFG=$(grep -E '^#define[[:space:]]+LOGICAL_NODE_NUM[[:space:]]'
     { echo "Error: could not read LOGICAL_NODE_NUM from src/common/constants.h"; exit 1; }
 GRAPH_ENTRIES="${GRAPH_ENTRIES:-$(( (2 << 20) / LOGICAL_NODE_NUM_CFG ))}"
 # Key traces. KEY_TRACE is a directory holding a separate trace per benchmark, so the
-# read-only and read-write runs can be driven by different key streams (files named ro
-# and rw, text or raw int32 - the loader sniffs). Paths are relative
+# read-only and read-write runs can be driven by different key streams. Paths are relative
 # to PROJECT_ROOT, which is where this script cds to.
 #   KEY_TRACE=builtin        use MEGALON's own zipfian generator for both
 #   RO_TRACE / RW_TRACE      override either path individually (or set one to "builtin")
@@ -53,8 +52,8 @@ if [ "$KEY_TRACE" = "builtin" ]; then
     RO_TRACE="${RO_TRACE:-builtin}"
     RW_TRACE="${RW_TRACE:-builtin}"
 else
-    RO_TRACE="${RO_TRACE:-$KEY_TRACE/ro}"
-    RW_TRACE="${RW_TRACE:-$KEY_TRACE/rw}"
+    RO_TRACE="${RO_TRACE:-$KEY_TRACE/zipf}"
+    RW_TRACE="${RW_TRACE:-$KEY_TRACE/zipf_rw}"
 fi
 # Config. The stock eval scripts all sed -i config/a.yaml in place, which permanently
 # edits a checked-in file that eval1..eval8 share. Generate our own instead, so a hashmap
@@ -176,7 +175,7 @@ for t in "$RO_TRACE" "$RW_TRACE"; do
     fi
     if [ ! -r "$t" ]; then
         echo "Key trace not readable: $t"
-        echo "Expected \$KEY_TRACE/ro and \$KEY_TRACE/rw under $(pwd)/${KEY_TRACE#./},"
+        echo "Expected \$KEY_TRACE/zipf and \$KEY_TRACE/zipf_rw under $(pwd)/${KEY_TRACE#./},"
         echo "or set RO_TRACE / RW_TRACE explicitly, or KEY_TRACE=builtin to use MEGALON's"
         echo "zipfian generator instead."
         exit 1
